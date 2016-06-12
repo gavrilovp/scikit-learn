@@ -18,6 +18,10 @@ class VotingImputer(BaseEstimator, TransformerMixin):
         self.missing_values = missing_values
 
     def fit(self, X, y=None):
+        if self.estimators is None or len(self.estimators) == 0:
+            raise AttributeError('Invalid `estimators` attribute, `estimators`'
+                                 ' should be a list of (string, estimator)'
+                                 ' tuples')
         self.estimators_ = []
         for name, clf in self.estimators:
             fitted_clf = clone(clf).fit(X, y)

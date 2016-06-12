@@ -2,7 +2,6 @@
 # License: BSD 3 clause
 
 import warnings
-
 import numpy as np
 import numpy.ma as ma
 from scipy import sparse
@@ -15,7 +14,7 @@ from ..utils.fixes import astype
 from ..utils.sparsefuncs import _get_median
 from ..utils.validation import check_is_fitted
 from ..utils.validation import FLOAT_DTYPES
-
+from ..utils import gen_batches
 from ..externals import six
 
 zip = six.moves.zip
@@ -83,12 +82,15 @@ class Imputer(BaseEstimator, TransformerMixin):
           the axis.
         - If "most_frequent", then replace missing using the most frequent
           value along the axis.
+        - If "knn", then replace missing using the mean of the k-nearest
+          neighbors along the axis. Only samples with no missing values are
+          considered as neighbors.
 
     axis : integer, optional (default=0)
         The axis along which to impute.
 
-        - If `axis=0`, then impute along columns.
-        - If `axis=1`, then impute along rows.
+        - If ``axis=0``, then impute along columns.
+        - If ``axis=1``, then impute along rows.
 
     verbose : integer, optional (default=0)
         Controls the verbosity of the imputer.
@@ -100,8 +102,12 @@ class Imputer(BaseEstimator, TransformerMixin):
 
         - If X is not an array of floating values;
         - If X is sparse and `missing_values=0`;
-        - If `axis=0` and X is encoded as a CSR matrix;
-        - If `axis=1` and X is encoded as a CSC matrix.
+        - If ``axis=0`` and X is encoded as a CSR matrix;
+        - If ``axis=1`` and X is encoded as a CSC matrix.
+
+    n_neighbors : int, optional (default=1)
+        Controls the number of nearest neighbors used to compute the mean
+        along the axis. Only used when ``strategy=knn``
 
     add_indicator_features : boolean, optional (default=False)
         If True, the transformed ``X`` will have binary indicator features
@@ -112,6 +118,7 @@ class Imputer(BaseEstimator, TransformerMixin):
     ----------
     statistics_ : array of shape (n_features,)
         The imputation fill value for each feature if axis == 0.
+        If ``strategy=knn``, then it contains those samples having no missing value.
 
     imputed_features_ : array of shape (n_features_with_missing, )
         The input features which have been imputed during transform.
@@ -125,15 +132,17 @@ class Imputer(BaseEstimator, TransformerMixin):
     - When ``axis=1``, an exception is raised if there are rows for which it is
       not possible to fill in the missing values (e.g., because they only
       contain missing values).
+    - Knn strategy currently doesn't support sparse matrix.
     """
     def __init__(self, missing_values="NaN", strategy="mean",
-                 axis=0, verbose=0, copy=True, add_indicator_features=False):
+                 axis=0, verbose=0, copy=True, add_indicator_features=False, n_neighbors=1):
         self.missing_values = missing_values
         self.strategy = strategy
         self.axis = axis
         self.verbose = verbose
         self.copy = copy
         self.add_indicator_features = add_indicator_features
+        self.n_neighbors = n_neighbors
 
     def fit(self, X, y=None):
         """Fit the imputer on X.
@@ -150,7 +159,7 @@ class Imputer(BaseEstimator, TransformerMixin):
             Returns self.
         """
         # Check parameters
-        allowed_strategies = ["mean", "median", "most_frequent"]
+        allowed_strategies = ["mean", "median", "most_frequent", "knn"]
         if self.strategy not in allowed_strategies:
             raise ValueError("Can only use these strategies: {0} "
                              " got strategy={1}".format(allowed_strategies,
@@ -260,6 +269,11 @@ class Imputer(BaseEstimator, TransformerMixin):
 
                 return most_frequent
 
+            # KNN
+            elif strategy == "knn":
+                raise ValueError("strategy='knn' does not support sparse "
+                                 "matrix input")
+
     def _dense_fit(self, X, strategy, missing_values, axis):
         """Fit the transformer on dense data."""
         X = check_array(X, force_all_finite=False)
@@ -310,6 +324,27 @@ class Imputer(BaseEstimator, TransformerMixin):
                 most_frequent[i] = _most_frequent(row, np.nan, 0)
 
             return most_frequent
+
+        # KNN
+        elif strategy == "knn":
+
+            if axis == 1:
+                X = X.transpose()
+                mask = mask.transpose()
+
+            # Get samples with complete features
+            full_data = X[np.logical_not(mask.any(axis=1))]
+            if full_data.size == 0:
+                raise ValueError("There is no sample with complete data.")
+            if full_data.shape[0] < self.n_neighbors:
+                raise ValueError("There are only %d complete samples, "
+                                 "but n_neighbors=%d."
+                                 % (full_data.shape[0], self.n_neighbors))
+            # Transpose back
+            if axis == 1:
+                full_data = full_data.transpose()
+
+            return full_data
 
     def _sparse_transform(self, X, valid_stats, valid_idx):
         """transformer on sparse data."""
@@ -411,7 +446,8 @@ class Imputer(BaseEstimator, TransformerMixin):
         valid_mask = np.logical_not(invalid_mask)
         valid_statistics = statistics[valid_mask]
         valid_idx = np.where(valid_mask)[0]
-        missing = np.arange(X.shape[not self.axis])[invalid_mask]
+        if self.strategy != "knn":
+            missing = np.arange(X.shape[not self.axis])[invalid_mask]
 
         if self.axis == 0 and invalid_mask.any():
             if self.verbose:
@@ -431,6 +467,55 @@ class Imputer(BaseEstimator, TransformerMixin):
             if sparse.issparse(X):
                 X = X.toarray()
 
-            X = self._dense_transform(X, valid_statistics, valid_idx)
+            mask = _get_mask(X, self.missing_values)
+            n_missing = np.sum(mask, axis=self.axis)
+
+            if self.strategy == 'knn':
+                if self.axis == 1:
+                    X = X.transpose()
+                    mask = mask.transpose()
+                    statistics = statistics.transpose()
+
+                batch_size = 1  # set batch size for block query
+
+                missing_index = np.where(mask.any(axis=1))[0]
+                D2 = np.empty_like(np.zeros([batch_size, statistics.shape[0],
+                                             statistics.shape[1]]))
+
+                # Preallocate output array for np.multiply(test1, test1, out=D2)
+                for sl in gen_batches(len(missing_index), batch_size):
+                    X_sl = X[missing_index[sl]]
+                    mask_sl = mask[missing_index[sl]]
+                    X_sl[mask_sl] = np.nan
+                    impute_dist = X_sl[:][:, np.newaxis, :] - statistics
+
+                    # For the last slice, the length may not be the same
+                    # as batch_size
+                    if impute_dist.shape != D2.shape:
+                        D2 = np.empty_like(impute_dist)
+
+                    np.multiply(impute_dist, impute_dist, out=D2)
+                    D2[np.isnan(D2)] = 0
+                    missing_row, missing_col = np.where(np.isnan(X_sl))
+                    sqdist = D2.sum(axis=2)
+                    target_index = np.argsort(sqdist, axis=1)[:, :self.n_neighbors]
+                    means = np.mean(statistics[target_index], axis=1)
+                    X_sl[missing_row, missing_col] = means[np.where(np.isnan(X_sl))[0],
+                                                           missing_col]
+                    X[missing_index[sl]] = X_sl
+
+                if self.axis == 1:
+                    X = X.transpose()
+
+            else:
+                X = self._dense_transform(X, valid_statistics, valid_idx)
+                values = np.repeat(valid_statistics, n_missing)
+
+                if self.axis == 0:
+                    coordinates = np.where(mask.transpose())[::-1]
+                else:
+                    coordinates = mask
+
+                X[coordinates] = values
 
         return X
