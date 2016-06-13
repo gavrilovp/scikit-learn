@@ -4,6 +4,7 @@ import numpy as np
 from ..base import BaseEstimator
 from ..base import TransformerMixin
 from ..base import clone
+from ..utils.validation import check_is_fitted
 
 
 class VotingImputer(BaseEstimator, TransformerMixin):
@@ -30,6 +31,7 @@ class VotingImputer(BaseEstimator, TransformerMixin):
         return self
 
     def transform(self, X):
+        check_is_fitted(self, "estimators_")
         if self.missing_values == "NaN" or np.isnan(self.missing_values):
             mask = np.isnan(X)
         else:
